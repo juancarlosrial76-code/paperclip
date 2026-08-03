@@ -78,6 +78,7 @@ import {
   CHAT_PROVIDERS,
   CONNECTION_INTENT_AGENT_GUIDANCE,
   CONNECTION_RUNTIME_TOOL_NAMES,
+  DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
   ISSUE_DISPOSITION_REPAIR_RETRY_REASON,
   PROVIDER_QUOTA_MONITOR_SERVICE_NAME,
@@ -11046,8 +11047,11 @@ export function heartbeatService(
     if (timeoutAt && input.now.getTime() >= timeoutAt.getTime()) {
       return "timeout_exceeded";
     }
-    const maxAttempts = input.monitor?.maxAttempts ?? null;
-    if (maxAttempts !== null && input.nextAttemptCount > maxAttempts) {
+    // Monitors re-arm themselves after each dispatch, so the attempt ceiling is
+    // what stops an otherwise unbounded monitor. Falling back to the default
+    // keeps that termination guarantee for policies that name neither bound.
+    const maxAttempts = input.monitor?.maxAttempts ?? DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS;
+    if (input.nextAttemptCount > maxAttempts) {
       return "max_attempts_exhausted";
     }
     return null;
@@ -11417,6 +11421,7 @@ export function heartbeatService(
       serviceName: monitor?.serviceName ?? null,
       timeoutAt: monitor?.timeoutAt ?? null,
       maxAttempts: monitor?.maxAttempts ?? null,
+      intervalSeconds: monitor?.intervalSeconds ?? null,
       recoveryPolicy: monitor?.recoveryPolicy ?? null,
     };
     const executionState =
@@ -11558,14 +11563,16 @@ export function heartbeatService(
           },
         });
 
+      const triggeredPatch = buildIssueMonitorTriggeredPatch({
+        issue: claimed,
+        policy,
+        triggeredAt: input.now,
+      });
+
       await db
         .update(issues)
         .set({
-          ...buildIssueMonitorTriggeredPatch({
-            issue: claimed,
-            policy,
-            triggeredAt: input.now,
-          }),
+          ...triggeredPatch,
           updatedAt: new Date(),
         })
         .where(eq(issues.id, claimed.id));
@@ -11586,6 +11593,7 @@ export function heartbeatService(
           attemptCount: nextAttemptCount,
           notes: claimed.monitorNotes ?? null,
           ...monitorMetadata,
+          rearmedNextCheckAt: triggeredPatch.monitorNextCheckAt?.toISOString() ?? null,
           source: input.activitySource,
         },
       });

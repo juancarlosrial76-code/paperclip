@@ -3900,7 +3900,8 @@ async function listIssueBlockerAttentionMap(
           ),
         );
       for (const row of monitorRows) {
-        if (hasScheduledIssueMonitorPath(row, monitorNowMs)) explicitWaitingIssueIds.add(row.id);
+        if (hasScheduledIssueMonitorPath(row, monitorNowMs))
+          explicitWaitingIssueIds.add(row.id);
       }
 
       const interactionRows: Array<{ issueId: string }> = await dbOrTx

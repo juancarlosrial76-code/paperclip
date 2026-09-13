@@ -2520,7 +2520,10 @@ async function listIssueBlockerAttentionMap(
     // comparison: it also drops monitors past timeoutAt or maxAttempts, which no
     // longer fire and therefore must not read as covered.
     const monitorNowMs = Date.now();
-    for (const chunk of chunkList(explicitWaitCandidateIds, ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE)) {
+    for (const chunk of chunkList(
+      explicitWaitCandidateIds,
+      ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE,
+    )) {
       const monitorRows: Array<{
         id: string;
         companyId: string;
@@ -2552,7 +2555,8 @@ async function listIssueBlockerAttentionMap(
           ),
         );
       for (const row of monitorRows) {
-        if (hasScheduledIssueMonitorPath(row, monitorNowMs)) explicitWaitingIssueIds.add(row.id);
+        if (hasScheduledIssueMonitorPath(row, monitorNowMs))
+          explicitWaitingIssueIds.add(row.id);
       }
 
       const interactionRows: Array<{ issueId: string }> = await dbOrTx

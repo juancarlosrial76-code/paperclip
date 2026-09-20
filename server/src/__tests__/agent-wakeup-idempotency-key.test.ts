@@ -258,8 +258,13 @@ describeEmbeddedPostgres("agent wakeup idempotency keys", () => {
     const duplicateId = randomUUID();
 
     // Recreate the pre-migration state: the index does not exist yet, so two
-    // wakes can hold the same key, each with its own queued run.
+    // wakes can hold the same key, each with its own queued run. The migration
+    // breaks ties on `requested_at`, then falls back to `id`; give the two rows
+    // distinct timestamps so the survivor is deterministic regardless of how
+    // the random UUIDs happen to compare.
     await db.execute(sql`drop index "agent_wakeup_requests_company_idempotency_key_uq"`);
+    const earlierRequestedAt = new Date();
+    const laterRequestedAt = new Date(earlierRequestedAt.getTime() + 1000);
     await db.insert(agentWakeupRequests).values([
       {
         id: survivorId,
@@ -271,6 +276,7 @@ describeEmbeddedPostgres("agent wakeup idempotency keys", () => {
         status: "queued",
         idempotencyKey,
         runId: randomUUID(),
+        requestedAt: earlierRequestedAt,
       },
       {
         id: duplicateId,
@@ -282,6 +288,7 @@ describeEmbeddedPostgres("agent wakeup idempotency keys", () => {
         status: "queued",
         idempotencyKey,
         runId: randomUUID(),
+        requestedAt: laterRequestedAt,
       },
     ]);
 

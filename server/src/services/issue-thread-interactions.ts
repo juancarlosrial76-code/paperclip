@@ -4255,33 +4255,39 @@ export function issueThreadInteractionService(
         throw interactionTerminalError(current);
       }
 
-      const [updated] = await db
-        .update(issueThreadInteractions)
-        .set({
-          status: "rejected",
-          result: {
-            version: 1,
-            rejectionReason: input.reason?.trim() || null,
-          },
-          resolvedByAgentId: actor.agentId ?? null,
-          resolvedByRunId: actor.runId ?? null,
-          resolvedByUserId: actor.userId ?? null,
-          resolvedAt: new Date(),
-          updatedAt: new Date(),
-        })
-        .where(
-          and(
-            eq(issueThreadInteractions.id, interactionId),
-            eq(issueThreadInteractions.status, "pending"),
-          ),
-        )
-        .returning();
+      const updated = await db.transaction(async (tx) => {
+        const [row] = await tx
+          .update(issueThreadInteractions)
+          .set({
+            status: "rejected",
+            result: {
+              version: 1,
+              rejectionReason: input.reason?.trim() || null,
+            },
+            resolvedByAgentId: actor.agentId ?? null,
+            resolvedByRunId: actor.runId ?? null,
+            resolvedByUserId: actor.userId ?? null,
+            resolvedAt: new Date(),
+            updatedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(issueThreadInteractions.id, interactionId),
+              eq(issueThreadInteractions.status, "pending"),
+            ),
+          )
+          .returning();
 
-      if (!updated) {
-        throw interactionAlreadyResolvedError();
-      }
+        if (!row) {
+          throw interactionAlreadyResolvedError();
+        }
+        // See the matching comment in withdrawInteraction: touching the issue
+        // inside this transaction is what makes the resolution visible to
+        // ensureReusedInteractionHasLiveWakeTarget's issue-lock re-read.
+        await touchIssue(tx, issue.id);
+        return row;
+      });
 
-      await touchIssue(db, issue.id);
       const rejected = hydrateInteraction(updated);
       await emitInteractionResolvedTelemetry(db, rejected);
       return rejected;
@@ -4875,10 +4881,18 @@ export function issueThreadInteractionService(
           tx as unknown as Db,
           withdrawn,
         );
+        // Touching the issue inside this same transaction (not after it commits)
+        // is what lets ensureReusedInteractionHasLiveWakeTarget's issue-row lock
+        // serialize against this resolution: that repair holds the issue lock and
+        // re-reads this interaction's status before deciding to adopt, and it only
+        // observes a resolution that has fully committed if the resolution wrote
+        // the issue row as part of committing. Touching it afterward, outside the
+        // transaction, would let the repair's re-read run between this
+        // transaction's commit and the separate touch and still see "pending".
+        await touchIssue(tx, issue.id);
         return row;
       });
 
-      await touchIssue(db, issue.id);
       const withdrawn = hydrateInteraction(updated);
       await emitInteractionResolvedTelemetry(db, withdrawn);
       return withdrawn;
@@ -4964,10 +4978,13 @@ export function issueThreadInteractionService(
           tx as unknown as Db,
           answered,
         );
+        // See the matching comment in withdrawInteraction: touching the issue
+        // inside this transaction, not after it, is what makes this resolution
+        // visible to ensureReusedInteractionHasLiveWakeTarget's issue-lock re-read.
+        await touchIssue(tx, issue.id);
         return row;
       });
 
-      await touchIssue(db, issue.id);
       const answered = hydrateInteraction(updated);
       await emitInteractionResolvedTelemetry(db, answered);
       return answered;
@@ -5053,10 +5070,11 @@ export function issueThreadInteractionService(
           tx as unknown as Db,
           hydrateInteraction(row),
         );
+        // See the matching comment in withdrawInteraction.
+        await touchIssue(tx, issue.id);
         return row;
       });
 
-      await touchIssue(db, issue.id);
       const skipped = hydrateInteraction(updated);
       await emitInteractionResolvedTelemetry(db, skipped);
       return skipped;
@@ -5128,10 +5146,11 @@ export function issueThreadInteractionService(
           tx as unknown as Db,
           cancelled,
         );
+        // See the matching comment in withdrawInteraction.
+        await touchIssue(tx, issue.id);
         return row;
       });
 
-      await touchIssue(db, issue.id);
       const cancelled = hydrateInteraction(updated);
       await emitInteractionResolvedTelemetry(db, cancelled);
       return cancelled;

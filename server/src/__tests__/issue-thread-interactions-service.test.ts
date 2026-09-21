@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -4246,5 +4246,153 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         status: "accepted",
       });
     });
+  });
+
+  describe("wake-target repair vs. concurrent resolution", () => {
+    it("does not re-adopt an issue whose pending interaction resolves while the repair is mid-transaction", async () => {
+      const { companyId, issueId } = await seedConfirmationIssue("Race between repair and answer");
+      const creatorAgentId = randomUUID();
+      const creatorRunId = randomUUID();
+      await db.insert(agents).values({
+        id: creatorAgentId,
+        companyId,
+        name: "Creator",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      await db.insert(heartbeatRuns).values({
+        id: creatorRunId,
+        companyId,
+        agentId: creatorAgentId,
+        invocationSource: "manual",
+        status: "running",
+        startedAt: new Date("2026-09-21T12:00:00.000Z"),
+      });
+
+      const payload = {
+        version: 1 as const,
+        questions: [{
+          id: "scope",
+          prompt: "Which scope?",
+          selectionMode: "single" as const,
+          options: [{ id: "phase-1", label: "Phase 1" }],
+        }],
+      };
+      const created = await interactionsSvc.create(
+        { id: issueId, companyId },
+        {
+          kind: "ask_user_questions" as const,
+          continuationPolicy: "wake_assignee" as const,
+          idempotencyKey: "race-repair-vs-answer:1",
+          payload,
+        },
+        { agentId: creatorAgentId },
+      );
+      // This PR's own create-path guard already adopted the creator. Null the
+      // assignee back out to reach the state the *reuse* repair exists for: a
+      // pending wake_assignee interaction on an issue that has since lost (or
+      // never had) its assignee.
+      await db.update(issues).set({ assigneeAgentId: null }).where(eq(issues.id, issueId));
+
+      // Pause any transaction that touches this issue row right after it writes
+      // it (uncommitted) — this is where `answerQuestions` now sits once it
+      // calls `touchIssue(tx, ...)` inside its own resolving transaction.
+      const advisoryLockKey = 481923557;
+      await db.execute(sql.raw(`
+        CREATE OR REPLACE FUNCTION paperclip_test_pause_issue_touch_${advisoryLockKey}()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $function$
+        BEGIN
+          IF NEW.id = '${issueId}' THEN
+            PERFORM pg_advisory_xact_lock(${advisoryLockKey});
+            PERFORM pg_sleep(1);
+          END IF;
+          RETURN NEW;
+        END
+        $function$;
+        CREATE TRIGGER paperclip_test_pause_issue_touch_${advisoryLockKey}
+        AFTER UPDATE ON issues
+        FOR EACH ROW EXECUTE FUNCTION paperclip_test_pause_issue_touch_${advisoryLockKey}();
+      `));
+
+      const otherDb = createDb(tempDb!.connectionString);
+      const otherInteractionsSvc = issueThreadInteractionService(otherDb);
+      try {
+        const answerPromise = interactionsSvc.answerQuestions(
+          { id: issueId, companyId },
+          created.id,
+          { answers: [{ questionId: "scope", optionIds: ["phase-1"] }] },
+          { agentId: creatorAgentId, runId: creatorRunId },
+        );
+
+        let paused = false;
+        for (let attempt = 0; attempt < 80; attempt += 1) {
+          const lockAvailable = await db.transaction(async (tx) => {
+            const [result] = await tx.execute<{ acquired: boolean }>(
+              sql`SELECT pg_try_advisory_lock(${advisoryLockKey}) AS acquired`,
+            );
+            if (result?.acquired) {
+              await tx.execute(sql`SELECT pg_advisory_unlock(${advisoryLockKey})`);
+            }
+            return result?.acquired ?? false;
+          });
+          if (!lockAvailable) {
+            paused = true;
+            break;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+        expect(paused).toBe(true);
+
+        // With the resolving transaction paused while holding the issue row
+        // lock, the reuse repair (fired by re-`create`-ing the same
+        // idempotency key from a second connection) must block behind it
+        // rather than proceed against a stale "pending" read.
+        let repairFinished = false;
+        const repairPromise = otherInteractionsSvc.create(
+          { id: issueId, companyId },
+          {
+            kind: "ask_user_questions" as const,
+            continuationPolicy: "wake_assignee" as const,
+            idempotencyKey: "race-repair-vs-answer:1",
+            payload,
+          },
+          { agentId: creatorAgentId },
+        ).then((result) => {
+          repairFinished = true;
+          return result;
+        });
+
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        expect(repairFinished).toBe(false);
+
+        const answered = await answerPromise;
+        const repaired = await repairPromise;
+
+        expect(answered.status).toBe("answered");
+        expect(repaired.id).toBe(created.id);
+        // The resolution committed first (inside the transaction that also
+        // touched the issue row), so the repair's re-read must observe
+        // "answered" and must not adopt the issue for a continuation that was
+        // already spent by the time the repair's transaction ran.
+        const finalIssue = await db
+          .select({ assigneeAgentId: issues.assigneeAgentId })
+          .from(issues)
+          .where(eq(issues.id, issueId))
+          .then((rows) => rows[0]);
+        expect(finalIssue?.assigneeAgentId).toBeNull();
+      } finally {
+        await otherDb.$client.end({ timeout: 5 });
+        await db.execute(sql.raw(`
+          DROP TRIGGER IF EXISTS paperclip_test_pause_issue_touch_${advisoryLockKey} ON issues;
+          DROP FUNCTION IF EXISTS paperclip_test_pause_issue_touch_${advisoryLockKey}();
+        `));
+      }
+    }, 15_000);
   });
 });

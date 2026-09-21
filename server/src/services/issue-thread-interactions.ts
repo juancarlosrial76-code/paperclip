@@ -4256,6 +4256,16 @@ export function issueThreadInteractionService(
       }
 
       const updated = await db.transaction(async (tx) => {
+        // Touch the issue before touching the interaction, not after: `create()`
+        // locks the issue row first and only then updates an existing pending
+        // interaction (the supersede path), so any resolution path that took the
+        // opposite order -- interaction first, issue second -- could deadlock
+        // against a concurrent `create()` racing on the same issue+interaction
+        // (Greptile P1 on an earlier revision of this ordering). Locking the
+        // issue first here keeps every path that can touch both rows in the
+        // same order. See the matching comment in withdrawInteraction for the
+        // reason touchIssue has to run inside this transaction at all.
+        await touchIssue(tx, issue.id);
         const [row] = await tx
           .update(issueThreadInteractions)
           .set({
@@ -4281,10 +4291,6 @@ export function issueThreadInteractionService(
         if (!row) {
           throw interactionAlreadyResolvedError();
         }
-        // See the matching comment in withdrawInteraction: touching the issue
-        // inside this transaction is what makes the resolution visible to
-        // ensureReusedInteractionHasLiveWakeTarget's issue-lock re-read.
-        await touchIssue(tx, issue.id);
         return row;
       });
 
@@ -4823,6 +4829,16 @@ export function issueThreadInteractionService(
       // review queue while the card is still pending, and an executable
       // request must not outlive a withdrawn card.
       const updated = await db.transaction(async (tx) => {
+        // Lock the issue row before anything else in this transaction. `create()`
+        // locks the issue first and only then updates an existing pending
+        // interaction (the supersede path); a resolution path that acquired the
+        // interaction lock first and the issue lock second could deadlock against
+        // a concurrent `create()` racing on the same issue+interaction (Greptile
+        // P1 on an earlier revision of this ordering). Every lock this
+        // transaction takes on `issues` or `issue_thread_interactions` has to
+        // follow that same issue-then-interaction order, so this comes before
+        // the interaction update below.
+        await touchIssue(tx, issue.id);
         await resolveLinkedToolActionRequests(tx, current, {
           status: "cancelled",
           fromStatuses: ["pending", "approved"],
@@ -4881,15 +4897,6 @@ export function issueThreadInteractionService(
           tx as unknown as Db,
           withdrawn,
         );
-        // Touching the issue inside this same transaction (not after it commits)
-        // is what lets ensureReusedInteractionHasLiveWakeTarget's issue-row lock
-        // serialize against this resolution: that repair holds the issue lock and
-        // re-reads this interaction's status before deciding to adopt, and it only
-        // observes a resolution that has fully committed if the resolution wrote
-        // the issue row as part of committing. Touching it afterward, outside the
-        // transaction, would let the repair's re-read run between this
-        // transaction's commit and the separate touch and still see "pending".
-        await touchIssue(tx, issue.id);
         return row;
       });
 
@@ -4938,6 +4945,16 @@ export function issueThreadInteractionService(
       });
 
       const updated = await db.transaction(async (tx) => {
+        // Lock the issue row before anything else in this transaction. `create()`
+        // locks the issue first and only then updates an existing pending
+        // interaction (the supersede path); a resolution path that acquired the
+        // interaction lock first and the issue lock second could deadlock against
+        // a concurrent `create()` racing on the same issue+interaction (Greptile
+        // P1 on an earlier revision of this ordering). Every lock this
+        // transaction takes on `issues` or `issue_thread_interactions` has to
+        // follow that same issue-then-interaction order, so this comes before
+        // the interaction update below.
+        await touchIssue(tx, issue.id);
         await mutationOptions.beforeResolveInTransaction?.(tx);
         const resolvedAt = new Date();
         const [row] = await tx
@@ -4978,10 +4995,6 @@ export function issueThreadInteractionService(
           tx as unknown as Db,
           answered,
         );
-        // See the matching comment in withdrawInteraction: touching the issue
-        // inside this transaction, not after it, is what makes this resolution
-        // visible to ensureReusedInteractionHasLiveWakeTarget's issue-lock re-read.
-        await touchIssue(tx, issue.id);
         return row;
       });
 
@@ -5016,6 +5029,16 @@ export function issueThreadInteractionService(
       const reason = data.reason?.trim() || null;
       const now = new Date();
       const updated = await db.transaction(async (tx) => {
+        // Lock the issue row before anything else in this transaction. `create()`
+        // locks the issue first and only then updates an existing pending
+        // interaction (the supersede path); a resolution path that acquired the
+        // interaction lock first and the issue lock second could deadlock against
+        // a concurrent `create()` racing on the same issue+interaction (Greptile
+        // P1 on an earlier revision of this ordering). Every lock this
+        // transaction takes on `issues` or `issue_thread_interactions` has to
+        // follow that same issue-then-interaction order, so this comes before
+        // the interaction update below.
+        await touchIssue(tx, issue.id);
         await resolveLinkedToolActionRequests(tx, current, {
           status: "cancelled",
           fromStatuses: ["pending", "approved"],
@@ -5070,8 +5093,6 @@ export function issueThreadInteractionService(
           tx as unknown as Db,
           hydrateInteraction(row),
         );
-        // See the matching comment in withdrawInteraction.
-        await touchIssue(tx, issue.id);
         return row;
       });
 
@@ -5113,6 +5134,16 @@ export function issueThreadInteractionService(
 
       const reason = data.reason?.trim() || null;
       const updated = await db.transaction(async (tx) => {
+        // Lock the issue row before anything else in this transaction. `create()`
+        // locks the issue first and only then updates an existing pending
+        // interaction (the supersede path); a resolution path that acquired the
+        // interaction lock first and the issue lock second could deadlock against
+        // a concurrent `create()` racing on the same issue+interaction (Greptile
+        // P1 on an earlier revision of this ordering). Every lock this
+        // transaction takes on `issues` or `issue_thread_interactions` has to
+        // follow that same issue-then-interaction order, so this comes before
+        // the interaction update below.
+        await touchIssue(tx, issue.id);
         const resolvedAt = new Date();
         const [row] = await tx
           .update(issueThreadInteractions)
@@ -5146,8 +5177,6 @@ export function issueThreadInteractionService(
           tx as unknown as Db,
           cancelled,
         );
-        // See the matching comment in withdrawInteraction.
-        await touchIssue(tx, issue.id);
         return row;
       });
 

@@ -1,4 +1,8 @@
-import { currentContinuationOrigins } from "./execution-continuation.js";
+import {
+  currentContinuationOrigins,
+  deliveredContinuationCommentIds,
+} from "./execution-continuation.js";
+import { assertAgentRunWriteAllowed } from "../agent-run-cancellation.js";
 import { connectionIntentDeliveries } from "@paperclipai/db";
 import { isDeepStrictEqual } from "node:util";
 import {
@@ -6,6 +10,7 @@ import {
   asc,
   desc,
   eq,
+  gte,
   inArray,
   isNotNull,
   isNull,
@@ -94,6 +99,7 @@ import {
   type ActivityPublication,
 } from "./activity-log.js";
 import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
+import { getNativeReviewAssignment } from "./native-runtime/native-review-participant.js";
 import {
   assertIssueReviewVerdictActorAllowed,
   isIssueReviewVerdictInteraction,
@@ -139,6 +145,14 @@ type InteractionActor = {
   suggestedTaskEffectsAuthorized?: boolean;
   resolutionDetails?: Record<string, unknown>;
 };
+
+async function assertInteractionRunWriteAllowed(tx: Db, issue: { id: string; companyId: string }, actor: InteractionActor) {
+  if (!actor.agentId || !actor.runId) return;
+  // Keep the same issue -> run lock order as task mutation and checkout.
+  await tx.select({ id: issues.id }).from(issues)
+    .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId))).for("update");
+  await assertAgentRunWriteAllowed(tx, issue.companyId, actor);
+}
 
 type CreateInteractionOptions = {
   /** Keep independently owned pending cards actionable. Internal runtime bridges use this. */
@@ -458,6 +472,7 @@ type IssueResolutionContext = {
   id: string;
   companyId: string;
   status: string;
+  executionRunId: string | null;
   workMode: string;
   assigneeAgentId: string | null;
   assigneeUserId: string | null;
@@ -484,6 +499,15 @@ async function assertRequestConfirmationResolutionAllowedUnderLock(
     (await isIssueReviewVerdictInteraction(tx, { issue, interaction }));
 
   assertInteractionResolutionAllowed(interaction, actor);
+  if (actor.agentId && isNativeCompletionReview(interaction)) {
+    const target = (interaction.payload as { target?: { revisionId?: string } }).target;
+    if (!actor.runId || !await getNativeReviewAssignment(tx, {
+      companyId: issue.companyId, issueId: issue.id, agentId: actor.agentId,
+      contextSnapshot: { nativeReviewInteractionId: interaction.id, nativeReviewDecisionId: target?.revisionId },
+      actingRunId: actor.runId,
+      issueExecutionRunId: issue.executionRunId,
+    })) throw conflict("This completion review is no longer current or assigned to this agent.");
+  }
   if (!isReviewVerdict) return;
 
   const verdictActor = actor.agentId
@@ -794,10 +818,6 @@ function interactionTerminalError(row: { status: string; result?: unknown }) {
   );
 }
 
-function isWakeAssigneeContinuationPolicy(continuationPolicy: string): boolean {
-  return continuationPolicy === "wake_assignee" || continuationPolicy === "wake_assignee_on_accept";
-}
-
 function shouldReturnAcceptedConfirmationToCreatorAgent(args: {
   issue: IssueResolutionContext;
   current: IssueThreadInteractionRow;
@@ -831,7 +851,7 @@ function normalizeCreateInteractionInput(
         ...input,
         payload: {
           ...input.payload,
-          supersedeOnUserComment: input.payload.supersedeOnUserComment ?? true,
+          supersedeOnUserComment: input.payload.supersedeOnUserComment ?? false,
         },
       };
     case "request_confirmation":
@@ -839,7 +859,7 @@ function normalizeCreateInteractionInput(
         ...input,
         payload: {
           ...input.payload,
-          supersedeOnUserComment: input.payload.supersedeOnUserComment ?? true,
+          supersedeOnUserComment: input.payload.supersedeOnUserComment ?? false,
         },
       };
     case "request_checkbox_confirmation":
@@ -847,7 +867,7 @@ function normalizeCreateInteractionInput(
         ...input,
         payload: {
           ...input.payload,
-          supersedeOnUserComment: input.payload.supersedeOnUserComment ?? true,
+          supersedeOnUserComment: input.payload.supersedeOnUserComment ?? false,
         },
       };
     case "request_item_verdicts":
@@ -855,7 +875,7 @@ function normalizeCreateInteractionInput(
         ...input,
         payload: {
           ...input.payload,
-          supersedeOnUserComment: input.payload.supersedeOnUserComment ?? true,
+          supersedeOnUserComment: input.payload.supersedeOnUserComment ?? false,
         },
       };
     default:
@@ -1999,134 +2019,6 @@ export function issueThreadInteractionService(
     return hydrateInteraction(current);
   }
 
-  /**
-   * A `wake_assignee` / `wake_assignee_on_accept` interaction only has a live
-   * continuation path if the issue carries an `assigneeAgentId` by the time it
-   * resolves — `queueResolvedInteractionContinuationWakeup` drops the wakeup
-   * otherwise, which leaves the interaction pending behind a permanently dead
-   * wake path until the slow ownerless sweep happens to notice.
-   *
-   * Adopt the creating agent as assignee when the issue is genuinely ownerless so
-   * that path always exists. Issues that already carry an `assigneeUserId` are
-   * deliberately left alone: a user assignee is itself a live waiting path
-   * (`ask_user_questions` on a user-owned issue is a pending *user* decision), and
-   * the issue schema permits only one assignee, so adopting here would silently
-   * take the issue away from its human owner.
-   *
-   * Callers must already hold a write lock on the issue row, and must have
-   * confirmed from that locked read that the issue carries neither an
-   * `assigneeAgentId` nor an `assigneeUserId`.
-   *
-   * Deliberately a single narrow UPDATE rather than `issueService.update()`. This
-   * runs inside the interaction-insert transaction while holding the issue row
-   * lock, and the full update path reads and writes further tables — which
-   * inverts lock order against heartbeat-run cleanup (whose `heartbeat_runs`
-   * delete cascades into `issues`) and deadlocks under concurrency. Keeping the
-   * transaction's footprint to `issues` plus the interaction row avoids the
-   * cycle. The WHERE guard makes the write a no-op if anything claimed the issue
-   * between the locked read and here.
-   */
-  async function adoptWakeTargetCreator(tx: Db, issueId: string, creatorAgentId: string) {
-    await tx
-      .update(issues)
-      .set({ assigneeAgentId: creatorAgentId, updatedAt: new Date() })
-      .where(and(
-        eq(issues.id, issueId),
-        isNull(issues.assigneeAgentId),
-        isNull(issues.assigneeUserId),
-      ));
-  }
-
-  /**
-   * Locked read + adopt, for callers that do not already hold the issue row.
-   */
-  async function ensureWakeAssigneeContinuationHasLiveTarget(
-    tx: Db,
-    args: {
-      issueId: string;
-      continuationPolicy: string;
-      creatorAgentId: string | null;
-      // Set on the reuse paths, where the interaction's status was read outside
-      // this transaction and can be stale by now. Left unset on the insert path,
-      // whose interaction is inserted by this very transaction.
-      requireStillPendingInteractionId?: string;
-    },
-  ) {
-    if (!args.creatorAgentId) return;
-    if (!isWakeAssigneeContinuationPolicy(args.continuationPolicy)) return;
-
-    // Lock the row so two agents racing on the same ownerless issue cannot both
-    // observe a null assignee and have the second adopt it out from under the first.
-    const current = await tx
-      .select({
-        assigneeAgentId: issues.assigneeAgentId,
-        assigneeUserId: issues.assigneeUserId,
-      })
-      .from(issues)
-      .where(eq(issues.id, args.issueId))
-      .for("update")
-      .then((rows) => rows[0] ?? null);
-
-    if (!current || current.assigneeAgentId || current.assigneeUserId) return;
-
-    // Re-read the interaction before writing. The reuse paths decided "still
-    // pending" from a snapshot taken outside this transaction, and a concurrent
-    // resolution can land in between. Adopting then would hand the issue to a
-    // creator whose one continuation has already been spent — an ownership change
-    // that buys no wake path, which is the opposite of this guard's purpose.
-    //
-    // Deliberately NOT `FOR UPDATE`. Every resolution path in this file writes the
-    // issue row before it commits (`touchIssue`, or `issueService.update` on the
-    // hand-back branch), so the issue lock this transaction already holds is what
-    // serializes us against all of them: a resolution either committed before we
-    // took that lock — and this read sees it — or it blocks behind us and commits
-    // after. Locking the interaction as well would buy nothing and would invert
-    // the lock order against paths that take the interaction first and only then
-    // write the issue (`submitItemVerdicts`), turning a benign read into a real
-    // deadlock cycle on the same issue.
-    if (args.requireStillPendingInteractionId) {
-      const currentInteraction = await tx
-        .select({ status: issueThreadInteractions.status })
-        .from(issueThreadInteractions)
-        .where(eq(issueThreadInteractions.id, args.requireStillPendingInteractionId))
-        .then((rows) => rows[0] ?? null);
-      if (!currentInteraction || currentInteraction.status !== "pending") return;
-    }
-
-    await adoptWakeTargetCreator(tx, args.issueId, args.creatorAgentId);
-  }
-
-  /**
-   * Same invariant as above, applied when `create` returns an *existing* row for
-   * an idempotent retry instead of inserting one. Those rows can predate this
-   * guard, or can have lost their assignee since, so reuse has to re-establish the
-   * wake target rather than assume the insert path already did — otherwise a retry
-   * quietly hands back an interaction that will never wake anyone.
-   *
-   * Only pending rows are repaired. An interaction that already resolved — accepted,
-   * rejected, answered, cancelled or expired — has spent its one continuation and
-   * can never wake anyone again, so adopting the issue for its historical creator
-   * would change ownership without buying a wake path.
-   */
-  async function ensureReusedInteractionHasLiveWakeTarget(
-    existing: IssueThreadInteractionRow,
-    actor: InteractionActor,
-  ) {
-    if (existing.status !== "pending") return;
-    const creatorAgentId = existing.createdByAgentId ?? actor.agentId ?? null;
-    if (!creatorAgentId) return;
-    if (!isWakeAssigneeContinuationPolicy(existing.continuationPolicy)) return;
-
-    await db.transaction(async (tx) => {
-      await ensureWakeAssigneeContinuationHasLiveTarget(tx as unknown as Db, {
-        issueId: existing.issueId,
-        continuationPolicy: existing.continuationPolicy,
-        creatorAgentId,
-        requireStillPendingInteractionId: existing.id,
-      });
-    });
-  }
-
   async function assertIssueWorkspaceFinalizedForAccept(args: {
     db: Pick<Db, "select">;
     issue: { id: string; companyId: string };
@@ -2224,6 +2116,7 @@ export function issueThreadInteractionService(
     const now = new Date();
     const postCommitActivityPublications: ActivityPublication[] = [];
     const result = await db.transaction(async (tx) => {
+      await assertInteractionRunWriteAllowed(tx as unknown as Db, args.issue, args.actor);
       await args.mutationOptions?.beforeResolveInTransaction?.(tx);
       // Policy mutations and review transitions use the same issue-row lock,
       // so the authoritative review policy and requester are stable through
@@ -2235,6 +2128,7 @@ export function issueThreadInteractionService(
           id: issues.id,
           companyId: issues.companyId,
           status: issues.status,
+          executionRunId: issues.executionRunId,
           workMode: issues.workMode,
           assigneeAgentId: issues.assigneeAgentId,
           assigneeUserId: issues.assigneeUserId,
@@ -2501,12 +2395,14 @@ export function issueThreadInteractionService(
 
     const now = new Date();
     const updated = await db.transaction(async (tx) => {
+      await assertInteractionRunWriteAllowed(tx as unknown as Db, args.issue, args.actor);
       await args.mutationOptions?.beforeResolveInTransaction?.(tx);
       const issueContext = await tx
         .select({
           id: issues.id,
           companyId: issues.companyId,
           status: issues.status,
+          executionRunId: issues.executionRunId,
           workMode: issues.workMode,
           assigneeAgentId: issues.assigneeAgentId,
           assigneeUserId: issues.assigneeUserId,
@@ -3521,7 +3417,6 @@ export function issueThreadInteractionService(
               },
             );
           }
-          await ensureReusedInteractionHasLiveWakeTarget(existing, actor);
           const interaction = hydrateInteraction(existing);
           await enqueueIssueInteractionChatPublications(db, interaction);
           return interaction;
@@ -3550,11 +3445,16 @@ export function issueThreadInteractionService(
 
       let originCommentIds: string[] = data.sourceCommentId ? [data.sourceCommentId] : [];
       let sourceIdentityContextId: string | null = null;
+      let sourceRunContext: Record<string, unknown> | null = null;
+      let sourceRunCreatedAt: Date | null = null;
       if (data.sourceRunId) {
         const sourceRun = await db
           .select({
             contextSnapshot: heartbeatRuns.contextSnapshot,
             companyId: heartbeatRuns.companyId,
+            agentId: heartbeatRuns.agentId,
+            nativeIssueId: heartbeatRuns.nativeIssueId,
+            createdAt: heartbeatRuns.createdAt,
             activeIdentityContextId: heartbeatRuns.activeIdentityContextId,
           })
           .from(heartbeatRuns)
@@ -3563,6 +3463,22 @@ export function issueThreadInteractionService(
         if (!sourceRun || sourceRun.companyId !== issue.companyId) {
           throw unprocessable("sourceRunId must belong to the same company");
         }
+        if (data.kind === "ask_user_questions") {
+          if (actor.agentId && sourceRun.agentId !== actor.agentId) {
+            throw unprocessable("sourceRunId must belong to the creating agent");
+          }
+          const snapshot = sourceRun.contextSnapshot ?? {};
+          const boundIssueIds = [
+            sourceRun.nativeIssueId,
+            snapshot.issueId,
+            snapshot.taskId,
+          ].filter((value): value is string => typeof value === "string" && value.length > 0);
+          if (boundIssueIds.some((boundIssueId) => boundIssueId !== issue.id)) {
+            throw unprocessable("sourceRunId must belong to the same issue");
+          }
+        }
+        sourceRunContext = sourceRun.contextSnapshot;
+        sourceRunCreatedAt = sourceRun.createdAt;
         originCommentIds = [...new Set([...originCommentIds, ...await currentContinuationOrigins(db, issue.companyId, issue.id, sourceRun.contextSnapshot)])];
         sourceIdentityContextId = actor.identityContextId ?? sourceRun.activeIdentityContextId;
         if (sourceIdentityContextId) {
@@ -3579,11 +3495,6 @@ export function issueThreadInteractionService(
         data.kind === "request_checkbox_confirmation" ||
         data.kind === "request_item_verdicts";
 
-      // Only agent-created interactions with a waking continuation policy can
-      // strand a wake path, so only those need the issue row locked for write.
-      const needsWakeTargetGuard =
-        Boolean(actor.agentId) && isWakeAssigneeContinuationPolicy(data.continuationPolicy);
-
       let created: IssueThreadInteractionRow;
       let superseded: IssueThreadInteractionRow[] = [];
       try {
@@ -3592,20 +3503,10 @@ export function issueThreadInteractionService(
         // transitions and against concurrent confirmations on the same issue.
         // Idempotent reuse above stays allowed so retries of a pre-close
         // create keep returning the (by now expired) original.
-        //
-        // The same locked read also serves the wake-target probe below: the
-        // terminal-status check and the assignee probe read one row under one
-        // lock, and because that lock is already FOR UPDATE the guard never has
-        // to upgrade it. Two agents racing to create an interaction on the same
-        // ownerless issue therefore serialize instead of both observing a null
-        // assignee (or deadlocking on a shared-to-exclusive upgrade).
         const result = await db.transaction(async (tx) => {
+          await assertInteractionRunWriteAllowed(tx as unknown as Db, issue, actor);
           const [issueRow] = await tx
-            .select({
-              status: issues.status,
-              assigneeAgentId: issues.assigneeAgentId,
-              assigneeUserId: issues.assigneeUserId,
-            })
+            .select({ status: issues.status })
             .from(issues)
             .where(
               and(
@@ -3616,6 +3517,42 @@ export function issueThreadInteractionService(
             .for("update");
           if (!issueRow || isTerminalIssueStatus(issueRow.status)) {
             throw conflict("Cannot create an interaction on a closed issue");
+          }
+          if (
+            data.kind === "ask_user_questions" &&
+            sourceRunContext &&
+            sourceRunCreatedAt
+          ) {
+            const delivered = deliveredContinuationCommentIds(sourceRunContext);
+            if (delivered.known) {
+              const newerHumanComments = await tx
+                .select({ id: issueComments.id })
+                .from(issueComments)
+                .where(
+                  and(
+                    eq(issueComments.companyId, issue.companyId),
+                    eq(issueComments.issueId, issue.id),
+                    eq(issueComments.authorType, "user"),
+                    isNotNull(issueComments.authorUserId),
+                    ne(issueComments.authorUserId, "board-concierge"),
+                    isNull(issueComments.createdByRunId),
+                    isNull(issueComments.deletedAt),
+                    gte(issueComments.createdAt, sourceRunCreatedAt),
+                  ),
+                );
+              const undelivered = newerHumanComments.filter(
+                (comment) => !delivered.ids.has(comment.id),
+              );
+              if (undelivered.length > 0) {
+                throw conflict(
+                  "New user comments arrived after this run's context; continue after queued comments are delivered",
+                  {
+                    reason: "newer_comment_not_delivered",
+                    commentIds: undelivered.map((comment) => comment.id),
+                  },
+                );
+              }
+            }
           }
           // Validate the plan/document confirmation target inside the same
           // transaction (locking the document row) so the latest-revision check
@@ -3657,22 +3594,6 @@ export function issueThreadInteractionService(
               payload: data.payload,
             })
             .returning();
-
-          // Adopt the creating agent as assignee when a waking interaction is
-          // created on a genuinely ownerless issue, so the continuation wakeup
-          // has a live target by the time the interaction resolves. Same
-          // transaction as the insert: an interaction that outlives a failed
-          // assignment is exactly the dead wake path this guards against.
-          // This runs before the supersede early-return below, so kinds that
-          // never supersede siblings still get their wake target.
-          if (
-            needsWakeTargetGuard
-            && actor.agentId
-            && !issueRow.assigneeAgentId
-            && !issueRow.assigneeUserId
-          ) {
-            await adoptWakeTargetCreator(tx as unknown as Db, issue.id, actor.agentId);
-          }
 
           // An agent replacing its own still-pending card supersedes the older
           // one so the thread never accumulates stale sibling cards. This covers
@@ -3771,7 +3692,6 @@ export function issueThreadInteractionService(
             },
           );
         }
-        await ensureReusedInteractionHasLiveWakeTarget(existing, actor);
         const interaction = hydrateInteraction(existing);
         await enqueueIssueInteractionChatPublications(db, interaction);
         return interaction;
@@ -3961,6 +3881,7 @@ export function issueThreadInteractionService(
       const createdWakeTargets: IssueWakeTarget[] = [];
 
       await db.transaction(async (tx) => {
+        await assertInteractionRunWriteAllowed(tx as unknown as Db, issue, actor);
         const resolvedAt = new Date();
         const [claimed] = await tx
           .update(issueThreadInteractions)
@@ -4118,6 +4039,7 @@ export function issueThreadInteractionService(
       assertIssueOpenForInteractionResolution(issue);
       const data = submitIssueThreadInteractionVerdictsSchema.parse(input);
       const submission = await db.transaction(async (tx) => {
+        await assertInteractionRunWriteAllowed(tx as unknown as Db, issue, actor);
         const current = await tx
           .select()
           .from(issueThreadInteractions)
@@ -4255,45 +4177,35 @@ export function issueThreadInteractionService(
         throw interactionTerminalError(current);
       }
 
-      const updated = await db.transaction(async (tx) => {
-        // Touch the issue before touching the interaction, not after: `create()`
-        // locks the issue row first and only then updates an existing pending
-        // interaction (the supersede path), so any resolution path that took the
-        // opposite order -- interaction first, issue second -- could deadlock
-        // against a concurrent `create()` racing on the same issue+interaction
-        // (Greptile P1 on an earlier revision of this ordering). Locking the
-        // issue first here keeps every path that can touch both rows in the
-        // same order. See the matching comment in withdrawInteraction for the
-        // reason touchIssue has to run inside this transaction at all.
-        await touchIssue(tx, issue.id);
-        const [row] = await tx
-          .update(issueThreadInteractions)
-          .set({
-            status: "rejected",
-            result: {
-              version: 1,
-              rejectionReason: input.reason?.trim() || null,
-            },
-            resolvedByAgentId: actor.agentId ?? null,
-            resolvedByRunId: actor.runId ?? null,
-            resolvedByUserId: actor.userId ?? null,
-            resolvedAt: new Date(),
-            updatedAt: new Date(),
-          })
-          .where(
-            and(
-              eq(issueThreadInteractions.id, interactionId),
-              eq(issueThreadInteractions.status, "pending"),
-            ),
-          )
-          .returning();
-
-        if (!row) {
-          throw interactionAlreadyResolvedError();
-        }
-        return row;
+      const [updated] = await db.transaction(async (tx) => {
+        await assertInteractionRunWriteAllowed(tx as unknown as Db, issue, actor);
+        return tx.update(issueThreadInteractions)
+        .set({
+          status: "rejected",
+          result: {
+            version: 1,
+            rejectionReason: input.reason?.trim() || null,
+          },
+          resolvedByAgentId: actor.agentId ?? null,
+          resolvedByRunId: actor.runId ?? null,
+          resolvedByUserId: actor.userId ?? null,
+          resolvedAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(issueThreadInteractions.id, interactionId),
+            eq(issueThreadInteractions.status, "pending"),
+          ),
+        )
+        .returning();
       });
 
+      if (!updated) {
+        throw interactionAlreadyResolvedError();
+      }
+
+      await touchIssue(db, issue.id);
       const rejected = hydrateInteraction(updated);
       await emitInteractionResolvedTelemetry(db, rejected);
       return rejected;
@@ -4829,16 +4741,7 @@ export function issueThreadInteractionService(
       // review queue while the card is still pending, and an executable
       // request must not outlive a withdrawn card.
       const updated = await db.transaction(async (tx) => {
-        // Lock the issue row before anything else in this transaction. `create()`
-        // locks the issue first and only then updates an existing pending
-        // interaction (the supersede path); a resolution path that acquired the
-        // interaction lock first and the issue lock second could deadlock against
-        // a concurrent `create()` racing on the same issue+interaction (Greptile
-        // P1 on an earlier revision of this ordering). Every lock this
-        // transaction takes on `issues` or `issue_thread_interactions` has to
-        // follow that same issue-then-interaction order, so this comes before
-        // the interaction update below.
-        await touchIssue(tx, issue.id);
+        await assertInteractionRunWriteAllowed(tx as unknown as Db, issue, actor);
         await resolveLinkedToolActionRequests(tx, current, {
           status: "cancelled",
           fromStatuses: ["pending", "approved"],
@@ -4900,6 +4803,7 @@ export function issueThreadInteractionService(
         return row;
       });
 
+      await touchIssue(db, issue.id);
       const withdrawn = hydrateInteraction(updated);
       await emitInteractionResolvedTelemetry(db, withdrawn);
       return withdrawn;
@@ -4945,16 +4849,7 @@ export function issueThreadInteractionService(
       });
 
       const updated = await db.transaction(async (tx) => {
-        // Lock the issue row before anything else in this transaction. `create()`
-        // locks the issue first and only then updates an existing pending
-        // interaction (the supersede path); a resolution path that acquired the
-        // interaction lock first and the issue lock second could deadlock against
-        // a concurrent `create()` racing on the same issue+interaction (Greptile
-        // P1 on an earlier revision of this ordering). Every lock this
-        // transaction takes on `issues` or `issue_thread_interactions` has to
-        // follow that same issue-then-interaction order, so this comes before
-        // the interaction update below.
-        await touchIssue(tx, issue.id);
+        await assertInteractionRunWriteAllowed(tx as unknown as Db, issue, actor);
         await mutationOptions.beforeResolveInTransaction?.(tx);
         const resolvedAt = new Date();
         const [row] = await tx
@@ -4998,6 +4893,7 @@ export function issueThreadInteractionService(
         return row;
       });
 
+      await touchIssue(db, issue.id);
       const answered = hydrateInteraction(updated);
       await emitInteractionResolvedTelemetry(db, answered);
       return answered;
@@ -5029,16 +4925,7 @@ export function issueThreadInteractionService(
       const reason = data.reason?.trim() || null;
       const now = new Date();
       const updated = await db.transaction(async (tx) => {
-        // Lock the issue row before anything else in this transaction. `create()`
-        // locks the issue first and only then updates an existing pending
-        // interaction (the supersede path); a resolution path that acquired the
-        // interaction lock first and the issue lock second could deadlock against
-        // a concurrent `create()` racing on the same issue+interaction (Greptile
-        // P1 on an earlier revision of this ordering). Every lock this
-        // transaction takes on `issues` or `issue_thread_interactions` has to
-        // follow that same issue-then-interaction order, so this comes before
-        // the interaction update below.
-        await touchIssue(tx, issue.id);
+        await assertInteractionRunWriteAllowed(tx as unknown as Db, issue, actor);
         await resolveLinkedToolActionRequests(tx, current, {
           status: "cancelled",
           fromStatuses: ["pending", "approved"],
@@ -5096,6 +4983,7 @@ export function issueThreadInteractionService(
         return row;
       });
 
+      await touchIssue(db, issue.id);
       const skipped = hydrateInteraction(updated);
       await emitInteractionResolvedTelemetry(db, skipped);
       return skipped;
@@ -5134,16 +5022,7 @@ export function issueThreadInteractionService(
 
       const reason = data.reason?.trim() || null;
       const updated = await db.transaction(async (tx) => {
-        // Lock the issue row before anything else in this transaction. `create()`
-        // locks the issue first and only then updates an existing pending
-        // interaction (the supersede path); a resolution path that acquired the
-        // interaction lock first and the issue lock second could deadlock against
-        // a concurrent `create()` racing on the same issue+interaction (Greptile
-        // P1 on an earlier revision of this ordering). Every lock this
-        // transaction takes on `issues` or `issue_thread_interactions` has to
-        // follow that same issue-then-interaction order, so this comes before
-        // the interaction update below.
-        await touchIssue(tx, issue.id);
+        await assertInteractionRunWriteAllowed(tx as unknown as Db, issue, actor);
         const resolvedAt = new Date();
         const [row] = await tx
           .update(issueThreadInteractions)
@@ -5180,6 +5059,7 @@ export function issueThreadInteractionService(
         return row;
       });
 
+      await touchIssue(db, issue.id);
       const cancelled = hydrateInteraction(updated);
       await emitInteractionResolvedTelemetry(db, cancelled);
       return cancelled;

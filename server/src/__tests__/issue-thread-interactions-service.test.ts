@@ -391,6 +391,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         { id: fixture.issueId, companyId: fixture.companyId },
         {
           kind: "ask_user_questions",
+          sourceRunId: fixture.runId,
           continuationPolicy: "wake_assignee",
           payload: {
             version: 1,
@@ -586,6 +587,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     const creatorAgentId = randomUUID();
     const addresseeAgentId = randomUUID();
     const unrelatedAgentId = randomUUID();
+    const creatorRunId = randomUUID();
     const addresseeRunId = randomUUID();
     const unrelatedRunId = randomUUID();
     const agentRows = [
@@ -604,6 +606,15 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     }));
     await db.insert(agents).values(agentRows);
     await db.insert(heartbeatRuns).values([
+      {
+        id: creatorRunId,
+        companyId,
+        agentId: creatorAgentId,
+        invocationSource: "manual",
+        status: "running",
+        startedAt: new Date("2026-07-25T11:59:00.000Z"),
+        contextSnapshot: { issueId },
+      },
       {
         id: addresseeRunId,
         companyId,
@@ -624,6 +635,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
 
     const input = {
       kind: "ask_user_questions" as const,
+      sourceRunId: creatorRunId,
       resolverPolicy: "board_or_agents" as const,
       addresseeAgentId,
       continuationPolicy: "wake_assignee" as const,
@@ -712,6 +724,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     const creatorAgentId = randomUUID();
     const addresseeAgentId = randomUUID();
     const unrelatedAgentId = randomUUID();
+    const creatorRunId = randomUUID();
     const unrelatedRunId = randomUUID();
     await db.insert(agents).values([
       { id: creatorAgentId, name: "Creator" },
@@ -727,19 +740,31 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       runtimeConfig: {},
       permissions: {},
     })));
-    await db.insert(heartbeatRuns).values({
-      id: unrelatedRunId,
-      companyId,
-      agentId: unrelatedAgentId,
-      invocationSource: "manual",
-      status: "running",
-      startedAt: new Date("2026-07-25T12:02:00.000Z"),
-    });
+    await db.insert(heartbeatRuns).values([
+      {
+        id: creatorRunId,
+        companyId,
+        agentId: creatorAgentId,
+        invocationSource: "manual",
+        status: "running",
+        startedAt: new Date("2026-07-25T12:01:30.000Z"),
+        contextSnapshot: { issueId },
+      },
+      {
+        id: unrelatedRunId,
+        companyId,
+        agentId: unrelatedAgentId,
+        invocationSource: "manual",
+        status: "running",
+        startedAt: new Date("2026-07-25T12:02:00.000Z"),
+      },
+    ]);
 
     const created = await interactionsSvc.create(
       { id: issueId, companyId },
       {
         kind: "ask_user_questions",
+        sourceRunId: creatorRunId,
         resolverPolicy: "board_or_agents",
         addresseeAgentId,
         payload: {
@@ -1715,6 +1740,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       invocationSource: "manual",
       status: "running",
       startedAt: new Date("2026-04-20T12:00:00.000Z"),
+      contextSnapshot: { issueId },
     });
 
     const input = {
@@ -1761,6 +1787,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     const { companyId, issueId } = await seedConfirmationIssue("Newer confirmation supersedes older");
     const firstAgentId = randomUUID();
     const secondAgentId = randomUUID();
+    const firstRunId = randomUUID();
     await db.insert(agents).values([
       {
         id: firstAgentId,
@@ -1785,15 +1812,34 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         permissions: {},
       },
     ]);
+    // Only the very first create on this still-ownerless issue needs a bound
+    // run -- it adopts the issue, so every later create in this test sees an
+    // already-assigned issue and skips the wake-target gate entirely.
+    await db.insert(heartbeatRuns).values({
+      id: firstRunId,
+      companyId,
+      agentId: firstAgentId,
+      invocationSource: "manual",
+      status: "running",
+      startedAt: new Date("2026-07-25T11:59:00.000Z"),
+      contextSnapshot: { issueId },
+    });
 
     const older = await interactionsSvc.create({ id: issueId, companyId }, {
       kind: "request_confirmation",
       idempotencyKey: "confirmation:first:older",
+      // request_confirmation defaults continuationPolicy to "none", so this
+      // does not touch the wake-target gate and needs no bound run.
       payload: { version: 1, prompt: "Approve the older draft?" },
     }, { agentId: firstAgentId });
+    // request_checkbox_confirmation defaults continuationPolicy to
+    // "wake_assignee" (unlike request_confirmation above), so this is the
+    // first create in this test that needs a bound run -- it adopts the
+    // issue, so every later create here sees an already-assigned issue.
     const otherKind = await interactionsSvc.create({ id: issueId, companyId }, {
       kind: "request_checkbox_confirmation",
       idempotencyKey: "checkbox:first",
+      sourceRunId: firstRunId,
       payload: {
         version: 1,
         prompt: "Select regions",
@@ -1864,8 +1910,32 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       },
     ]);
 
-    const question = (prompt: string) => ({
+    const probingRunId = randomUUID();
+    const probingOtherIssueRunId = randomUUID();
+    await db.insert(heartbeatRuns).values([
+      {
+        id: probingRunId,
+        companyId,
+        agentId: probingAgentId,
+        invocationSource: "manual",
+        status: "running",
+        startedAt: new Date("2026-07-25T11:58:00.000Z"),
+        contextSnapshot: { issueId },
+      },
+      {
+        id: probingOtherIssueRunId,
+        companyId,
+        agentId: probingAgentId,
+        invocationSource: "manual",
+        status: "running",
+        startedAt: new Date("2026-07-25T11:58:30.000Z"),
+        contextSnapshot: { issueId: otherIssueId },
+      },
+    ]);
+
+    const question = (prompt: string, sourceRunId?: string) => ({
       kind: "ask_user_questions" as const,
+      ...(sourceRunId ? { sourceRunId } : {}),
       payload: {
         version: 1 as const,
         questions: [{
@@ -1877,8 +1947,11 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       },
     });
 
+    // Only the first create on each still-ownerless issue needs a bound run --
+    // it adopts the issue, so later creates on the same issue (by any agent)
+    // see an already-assigned issue and skip the wake-target gate.
     const older = await interactionsSvc.create(
-      { id: issueId, companyId }, question("Older question"), { agentId: probingAgentId },
+      { id: issueId, companyId }, question("Older question", probingRunId), { agentId: probingAgentId },
     );
     const otherKind = await interactionsSvc.create({ id: issueId, companyId }, {
       kind: "request_confirmation",
@@ -1888,7 +1961,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       { id: issueId, companyId }, question("Other agent question"), { agentId: otherAgentId },
     );
     const otherIssueQuestion = await interactionsSvc.create(
-      { id: otherIssueId, companyId }, question("Other issue question"), { agentId: probingAgentId },
+      { id: otherIssueId, companyId }, question("Other issue question", probingOtherIssueRunId), { agentId: probingAgentId },
     );
     const replacement = await interactionsSvc.create(
       { id: issueId, companyId }, question("Newer question"), { agentId: probingAgentId },
@@ -4630,7 +4703,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     // with no assignment-specific check, so that let any agent able to see
     // such an issue claim exclusive ownership of it by posting a throwaway
     // `suggest_tasks` card -- without ever having executed on it.
-    it("does not adopt an agent whose source run is bound to a different issue", async () => {
+    it("rejects wake_assignee creation when the source run is bound to a different issue", async () => {
       const { companyId, goalId, issueId: ownIssueId } = await seedConfirmationIssue("Bystander's own task");
       // A second, unrelated ownerless issue in the same company -- the
       // bystander can see and mutate it (the route's broad visible-issue-write
@@ -4671,7 +4744,11 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         contextSnapshot: { issueId: ownIssueId },
       });
 
-      const created = await interactionsSvc.create(
+      // Rejected outright rather than silently inserted unassigned: a
+      // `wake_assignee` card nobody owns never gets a continuation wakeup
+      // queued on resolution, which would strand the work just as quietly
+      // as the unauthorized-adoption bug this guard closes.
+      await expect(interactionsSvc.create(
         { id: targetIssueId, companyId },
         {
           kind: "suggest_tasks" as const,
@@ -4680,13 +4757,71 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
           payload: { version: 1 as const, tasks: [{ clientKey: "task-1", title: "Opportunistic claim" }] },
         },
         { agentId: bystanderAgentId },
-      );
+      )).rejects.toMatchObject({
+        status: 422,
+        details: { code: "interaction_wake_target_unbound" },
+      });
 
-      expect(created.status).toBe("pending");
+      expect(await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, targetIssueId)))
+        .toHaveLength(0);
       const targetIssue = await db
         .select({ assigneeAgentId: issues.assigneeAgentId })
         .from(issues)
         .where(eq(issues.id, targetIssueId))
+        .then((rows) => rows[0]);
+      expect(targetIssue?.assigneeAgentId).toBeNull();
+    });
+
+    // Greptile P1 (2026-10-01): an on-demand run has no nativeIssueId or
+    // context issueId/taskId at all -- its snapshot carries no issue binding
+    // whatsoever, unlike the bystander case above where the run is bound to
+    // a *different* issue. Rejecting (rather than silently inserting an
+    // unassigned card) is deliberate: an on-demand agent must claim the
+    // issue through the normal checkout path first, so a real assignee
+    // exists before this gate is even reached again.
+    it("rejects wake_assignee creation from a genuinely unbound on-demand run", async () => {
+      const { companyId, issueId } = await seedConfirmationIssue("Ownerless issue touched by an on-demand run");
+      const onDemandAgentId = randomUUID();
+      const onDemandRunId = randomUUID();
+      await db.insert(agents).values({
+        id: onDemandAgentId,
+        companyId,
+        name: "On-demand sweep",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      await db.insert(heartbeatRuns).values({
+        id: onDemandRunId,
+        companyId,
+        agentId: onDemandAgentId,
+        invocationSource: "on_demand",
+        status: "running",
+        startedAt: new Date("2026-10-01T12:00:00.000Z"),
+        // No contextSnapshot at all -- an unscoped company-wide run.
+      });
+
+      await expect(interactionsSvc.create(
+        { id: issueId, companyId },
+        {
+          kind: "suggest_tasks" as const,
+          sourceRunId: onDemandRunId,
+          continuationPolicy: "wake_assignee" as const,
+          payload: { version: 1 as const, tasks: [{ clientKey: "task-1", title: "Found during the sweep" }] },
+        },
+        { agentId: onDemandAgentId },
+      )).rejects.toMatchObject({
+        status: 422,
+        details: { code: "interaction_wake_target_unbound" },
+      });
+
+      const targetIssue = await db
+        .select({ assigneeAgentId: issues.assigneeAgentId })
+        .from(issues)
+        .where(eq(issues.id, issueId))
         .then((rows) => rows[0]);
       expect(targetIssue?.assigneeAgentId).toBeNull();
     });
@@ -4760,6 +4895,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         invocationSource: "manual",
         status: "running",
         startedAt: new Date("2026-09-21T12:00:00.000Z"),
+        contextSnapshot: { issueId },
       });
 
       const payload = {
@@ -4775,6 +4911,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         { id: issueId, companyId },
         {
           kind: "ask_user_questions" as const,
+          sourceRunId: creatorRunId,
           continuationPolicy: "wake_assignee" as const,
           idempotencyKey: "race-repair-vs-answer:1",
           payload,
@@ -4847,6 +4984,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
           { id: issueId, companyId },
           {
             kind: "ask_user_questions" as const,
+            sourceRunId: creatorRunId,
             continuationPolicy: "wake_assignee" as const,
             idempotencyKey: "race-repair-vs-answer:1",
             payload,
@@ -4908,6 +5046,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       // passing either way.
       const { companyId, issueId } = await seedConfirmationIssue("Create-supersede vs answer race");
       const creatorAgentId = randomUUID();
+      const creatorRunId = randomUUID();
       await db.insert(agents).values({
         id: creatorAgentId,
         companyId,
@@ -4919,11 +5058,21 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
         runtimeConfig: {},
         permissions: {},
       });
+      await db.insert(heartbeatRuns).values({
+        id: creatorRunId,
+        companyId,
+        agentId: creatorAgentId,
+        invocationSource: "manual",
+        status: "running",
+        startedAt: new Date("2026-09-21T11:59:00.000Z"),
+        contextSnapshot: { issueId },
+      });
 
       const older = await interactionsSvc.create(
         { id: issueId, companyId },
         {
           kind: "ask_user_questions" as const,
+          sourceRunId: creatorRunId,
           continuationPolicy: "wake_assignee" as const,
           payload: {
             version: 1 as const,

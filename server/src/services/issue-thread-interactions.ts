@@ -3764,20 +3764,34 @@ export function issueThreadInteractionService(
           // This runs before the supersede early-return below, so kinds that
           // never supersede siblings still get their wake target.
           //
-          // Gated on sourceRunBoundToIssue: the production route allows any
+          // Requires sourceRunBoundToIssue: the production route allows any
           // agent broad write access to a visible ownerless issue with no
           // assignment-specific authorization, so without this check creating
           // a wake interaction would let an unrelated agent claim exclusive
           // ownership of any ownerless issue it can merely see (Superagent P2).
           // A source run bound to this exact issue is the same evidence
           // `ask_user_questions` already requires for a different reason.
+          //
+          // When that evidence is missing (an on-demand run with no
+          // issue/task binding), reject rather than silently inserting an
+          // unassigned pending card: a `wake_assignee` interaction nobody owns
+          // never gets a continuation wakeup queued on resolution elsewhere in
+          // this file (every wakeup call site requires `assigneeAgentId`),
+          // which strands the work exactly as AUR-644/AUR-939 demonstrated.
+          // Rejecting forces the caller through the normal claim/checkout
+          // path first, which sets a real assignee before this ever applies.
           if (
             needsWakeTargetGuard
             && actor.agentId
             && !issueRow.assigneeAgentId
             && !issueRow.assigneeUserId
-            && sourceRunBoundToIssue
           ) {
+            if (!sourceRunBoundToIssue) {
+              throw unprocessable(
+                "A wake_assignee interaction on an ownerless issue requires sourceRunId to be bound to this issue, so the continuation wakeup has a live target to resolve to",
+                { code: "interaction_wake_target_unbound", issueId: issue.id },
+              );
+            }
             await adoptWakeTargetCreator(tx as unknown as Db, issue.id, actor.agentId);
           }
 

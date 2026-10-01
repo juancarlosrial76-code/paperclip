@@ -4623,6 +4623,120 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     });
   });
 
+  describe("wake-target auto-adoption authorization", () => {
+    // Superagent P2 (2026-09-29): creating a wake interaction on a visible
+    // ownerless issue used to adopt the creating agent unconditionally. The
+    // production route authorizes broad writes to visible ownerless issues
+    // with no assignment-specific check, so that let any agent able to see
+    // such an issue claim exclusive ownership of it by posting a throwaway
+    // `suggest_tasks` card -- without ever having executed on it.
+    it("does not adopt an agent whose source run is bound to a different issue", async () => {
+      const { companyId, goalId, issueId: ownIssueId } = await seedConfirmationIssue("Bystander's own task");
+      // A second, unrelated ownerless issue in the same company -- the
+      // bystander can see and mutate it (the route's broad visible-issue-write
+      // policy), but never ran on it.
+      const targetIssueId = randomUUID();
+      await db.insert(issues).values({
+        id: targetIssueId,
+        companyId,
+        goalId,
+        title: "Unrelated ownerless issue",
+        status: "in_progress",
+        priority: "medium",
+      });
+
+      const bystanderAgentId = randomUUID();
+      const bystanderRunId = randomUUID();
+      await db.insert(agents).values({
+        id: bystanderAgentId,
+        companyId,
+        name: "Bystander",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      await db.insert(heartbeatRuns).values({
+        id: bystanderRunId,
+        companyId,
+        agentId: bystanderAgentId,
+        invocationSource: "manual",
+        status: "running",
+        startedAt: new Date("2026-09-29T12:00:00.000Z"),
+        // Bound to the bystander's OWN issue, not the target -- this is the
+        // only run evidence a `suggest_tasks` card can carry, since (unlike
+        // `ask_user_questions`) nothing else ties the card to the issue.
+        contextSnapshot: { issueId: ownIssueId },
+      });
+
+      const created = await interactionsSvc.create(
+        { id: targetIssueId, companyId },
+        {
+          kind: "suggest_tasks" as const,
+          sourceRunId: bystanderRunId,
+          continuationPolicy: "wake_assignee" as const,
+          payload: { version: 1 as const, tasks: [{ clientKey: "task-1", title: "Opportunistic claim" }] },
+        },
+        { agentId: bystanderAgentId },
+      );
+
+      expect(created.status).toBe("pending");
+      const targetIssue = await db
+        .select({ assigneeAgentId: issues.assigneeAgentId })
+        .from(issues)
+        .where(eq(issues.id, targetIssueId))
+        .then((rows) => rows[0]);
+      expect(targetIssue?.assigneeAgentId).toBeNull();
+    });
+
+    it("adopts an agent whose source run is genuinely bound to the target issue", async () => {
+      const { companyId, issueId } = await seedConfirmationIssue("Genuinely owned ownerless issue");
+      const agentId = randomUUID();
+      const runId = randomUUID();
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "Worker",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId,
+        invocationSource: "manual",
+        status: "running",
+        startedAt: new Date("2026-09-29T12:00:00.000Z"),
+        contextSnapshot: { issueId },
+      });
+
+      const created = await interactionsSvc.create(
+        { id: issueId, companyId },
+        {
+          kind: "suggest_tasks" as const,
+          sourceRunId: runId,
+          continuationPolicy: "wake_assignee" as const,
+          payload: { version: 1 as const, tasks: [{ clientKey: "task-1", title: "Legitimate work" }] },
+        },
+        { agentId },
+      );
+
+      expect(created.status).toBe("pending");
+      const targetIssue = await db
+        .select({ assigneeAgentId: issues.assigneeAgentId })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+      expect(targetIssue?.assigneeAgentId).toBe(agentId);
+    });
+  });
+
   describe("wake-target repair vs. concurrent resolution", () => {
     it("does not re-adopt an issue whose pending interaction resolves while the repair is mid-transaction", async () => {
       const { companyId, issueId } = await seedConfirmationIssue("Race between repair and answer");

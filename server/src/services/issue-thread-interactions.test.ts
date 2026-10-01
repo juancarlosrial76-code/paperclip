@@ -19,6 +19,12 @@ function createSelectChain(rows: SelectRow[], onLock?: (mode: string) => void) {
       onLock?.(mode);
       return result;
     },
+    orderBy() {
+      return result;
+    },
+    limit() {
+      return result;
+    },
     then(callback: (rows: SelectRow[]) => unknown) {
       return Promise.resolve(callback(rows));
     },
@@ -133,6 +139,8 @@ function createCreateFlowDb(args: {
   // it apart from `existingInteractionRow` to model a concurrent resolution
   // landing between the unlocked read and the transaction.
   lockedInteractionRow?: SelectRow | null;
+  // The heartbeat run `data.sourceRunId` resolves to, when a test passes one.
+  sourceRunRow?: SelectRow | null;
 }) {
   const touches: Array<Record<string, unknown>> = [];
   const events: string[] = [];
@@ -144,6 +152,10 @@ function createCreateFlowDb(args: {
       // every other select in the create flow (idempotency / source lookups) gets
       // an empty result, so this stays independent of call ordering.
       const wantsAssignee = Boolean(columns && "assigneeAgentId" in columns);
+      if (columns && "nativeIssueId" in columns) {
+        events.push("select:sourceRun");
+        return createSelectChain(args.sourceRunRow ? [args.sourceRunRow] : []);
+      }
       // The create path reads status and assignee together under one lock; the
       // idempotent-reuse path reads assignee columns on their own.
       if (columns && "status" in columns) {
@@ -352,6 +364,16 @@ describe("issueThreadInteractionService", { timeout: 30_000 }, () => {
 
     const { db, events, locks, touches } = createCreateFlowDb({
       currentIssueRow: { assigneeAgentId: null, assigneeUserId: null },
+      // Adoption requires evidence the creating agent is actually working this
+      // issue: a source run whose own context is bound to it.
+      sourceRunRow: {
+        companyId: "company-1",
+        agentId: "agent-1",
+        nativeIssueId: "11111111-1111-4111-8111-111111111111",
+        contextSnapshot: {},
+        createdAt: new Date("2026-04-20T09:00:00.000Z"),
+        activeIdentityContextId: null,
+      },
     });
 
     const svc = issueThreadInteractionService(db as never);
@@ -360,6 +382,7 @@ describe("issueThreadInteractionService", { timeout: 30_000 }, () => {
       companyId: "company-1",
     }, {
       kind: "ask_user_questions",
+      sourceRunId: "22222222-2222-4222-8222-222222222222",
       continuationPolicy: "wake_assignee",
       payload: {
         version: 1,
@@ -383,7 +406,7 @@ describe("issueThreadInteractionService", { timeout: 30_000 }, () => {
     expect(locks).toEqual(["update"]);
     // The adoption must happen inside the same transaction as the insert, so the
     // interaction and the wake target it depends on both land or neither does.
-    expect(events).toEqual(["tx:begin", "select:issue", "insert:interaction", "update:assignee", "tx:end"]);
+    expect(events).toEqual(["select:sourceRun", "tx:begin", "select:issue", "insert:interaction", "update:assignee", "tx:end"]);
   });
 
   it("create leaves a user-assigned issue alone for a wake_assignee interaction", async () => {
@@ -426,6 +449,14 @@ describe("issueThreadInteractionService", { timeout: 30_000 }, () => {
     const { db, events } = createCreateFlowDb({
       currentIssueRow: { assigneeAgentId: null, assigneeUserId: null },
       failAssignment: true,
+      sourceRunRow: {
+        companyId: "company-1",
+        agentId: "agent-1",
+        nativeIssueId: "11111111-1111-4111-8111-111111111111",
+        contextSnapshot: {},
+        createdAt: new Date("2026-04-20T09:00:00.000Z"),
+        activeIdentityContextId: null,
+      },
     });
 
     const svc = issueThreadInteractionService(db as never);
@@ -438,6 +469,7 @@ describe("issueThreadInteractionService", { timeout: 30_000 }, () => {
       companyId: "company-1",
     }, {
       kind: "ask_user_questions",
+      sourceRunId: "22222222-2222-4222-8222-222222222222",
       continuationPolicy: "wake_assignee",
       payload: {
         version: 1,

@@ -2134,10 +2134,15 @@ export function issueThreadInteractionService(
    */
   async function ensureReusedInteractionHasLiveWakeTarget(
     existing: IssueThreadInteractionRow,
-    actor: InteractionActor,
   ) {
     if (existing.status !== "pending") return;
-    const creatorAgentId = existing.createdByAgentId ?? actor.agentId ?? null;
+    // Deliberately `existing.createdByAgentId` only, never a fallback to the
+    // current caller: unlike the insert path, this repair runs for an actor who
+    // did not just pass the create-time source-run-binding check. Falling back
+    // to them would let anyone who can reproduce an idempotent create request
+    // (matching kind/policy/addressee/sourceRunId/idempotencyKey) claim an
+    // ownerless issue through a legacy row that never recorded a creator.
+    const creatorAgentId = existing.createdByAgentId;
     if (!creatorAgentId) return;
     if (!isWakeAssigneeContinuationPolicy(existing.continuationPolicy)) return;
 
@@ -3549,7 +3554,7 @@ export function issueThreadInteractionService(
               },
             );
           }
-          await ensureReusedInteractionHasLiveWakeTarget(existing, actor);
+          await ensureReusedInteractionHasLiveWakeTarget(existing);
           const interaction = hydrateInteraction(existing);
           await enqueueIssueInteractionChatPublications(db, interaction);
           return interaction;
@@ -3580,6 +3585,10 @@ export function issueThreadInteractionService(
       let sourceIdentityContextId: string | null = null;
       let sourceRunContext: Record<string, unknown> | null = null;
       let sourceRunCreatedAt: Date | null = null;
+      // Also gates auto-adoption below: only a source run whose own context is
+      // bound to this exact issue counts as evidence the creating agent is
+      // actually working this issue, not merely able to write to it.
+      let sourceRunBoundToIssue = false;
       if (data.sourceRunId) {
         const sourceRun = await db
           .select({
@@ -3596,16 +3605,19 @@ export function issueThreadInteractionService(
         if (!sourceRun || sourceRun.companyId !== issue.companyId) {
           throw unprocessable("sourceRunId must belong to the same company");
         }
+        const snapshot = sourceRun.contextSnapshot ?? {};
+        const boundIssueIds = [
+          sourceRun.nativeIssueId,
+          snapshot.issueId,
+          snapshot.taskId,
+        ].filter((value): value is string => typeof value === "string" && value.length > 0);
+        sourceRunBoundToIssue =
+          boundIssueIds.length > 0 &&
+          boundIssueIds.every((boundIssueId) => boundIssueId === issue.id);
         if (data.kind === "ask_user_questions") {
           if (actor.agentId && sourceRun.agentId !== actor.agentId) {
             throw unprocessable("sourceRunId must belong to the creating agent");
           }
-          const snapshot = sourceRun.contextSnapshot ?? {};
-          const boundIssueIds = [
-            sourceRun.nativeIssueId,
-            snapshot.issueId,
-            snapshot.taskId,
-          ].filter((value): value is string => typeof value === "string" && value.length > 0);
           if (boundIssueIds.some((boundIssueId) => boundIssueId !== issue.id)) {
             throw unprocessable("sourceRunId must belong to the same issue");
           }
@@ -3751,11 +3763,20 @@ export function issueThreadInteractionService(
           // assignment is exactly the dead wake path this guards against.
           // This runs before the supersede early-return below, so kinds that
           // never supersede siblings still get their wake target.
+          //
+          // Gated on sourceRunBoundToIssue: the production route allows any
+          // agent broad write access to a visible ownerless issue with no
+          // assignment-specific authorization, so without this check creating
+          // a wake interaction would let an unrelated agent claim exclusive
+          // ownership of any ownerless issue it can merely see (Superagent P2).
+          // A source run bound to this exact issue is the same evidence
+          // `ask_user_questions` already requires for a different reason.
           if (
             needsWakeTargetGuard
             && actor.agentId
             && !issueRow.assigneeAgentId
             && !issueRow.assigneeUserId
+            && sourceRunBoundToIssue
           ) {
             await adoptWakeTargetCreator(tx as unknown as Db, issue.id, actor.agentId);
           }
@@ -3857,7 +3878,7 @@ export function issueThreadInteractionService(
             },
           );
         }
-        await ensureReusedInteractionHasLiveWakeTarget(existing, actor);
+        await ensureReusedInteractionHasLiveWakeTarget(existing);
         const interaction = hydrateInteraction(existing);
         await enqueueIssueInteractionChatPublications(db, interaction);
         return interaction;

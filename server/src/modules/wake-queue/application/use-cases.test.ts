@@ -533,14 +533,16 @@ describe("releaseIssueExecution", () => {
     expect(result.outcome.kind).toBe("promoted");
   });
 
-  it("does not re-reopen a task whose comment already reopened it synchronously (AUR-2767)", async () => {
+  it("does not re-reopen a task whose own run already re-closed it after authoring the comment (AUR-2767)", async () => {
     // The route handler that creates an `issue_reopened_via_comment` wake
     // (server/src/routes/issues.ts) always writes the issue back to `todo`
     // itself before enqueueing the wake. By the time this wake drains here,
-    // the issue may legitimately be `done` again - e.g. the same assignee run
-    // read the triggering comment on its own and closed the issue a second
-    // time. Re-deriving a reopen from the stale `issue_reopened_via_comment`
-    // tag must not undo that later, informed closure.
+    // the issue may legitimately be `done` again because the same finishing
+    // run authored the triggering comment itself and then closed the issue a
+    // second time, an informed decision. Re-deriving a reopen from the stale
+    // `issue_reopened_via_comment` tag must not undo that closure, and since
+    // the finishing run demonstrably already saw the comment (it wrote it),
+    // no extra promotion is needed either.
     const queue = [wakeCandidate({
       agentId: ISSUE.assigneeAgentId!,
       requestedByActorType: "user",
@@ -549,6 +551,7 @@ describe("releaseIssueExecution", () => {
     })];
     const transaction = createFakeTransaction({
       findNextDeferredWake: vi.fn(async () => queue.shift() ?? null),
+      getCommentSelfAuthorship: vi.fn(async () => ({ allSelfAuthored: true })),
       reopenIssue: vi.fn(async () => ({ ...ISSUE, status: "todo" })),
     });
     const release = createReleaseIssueExecution({
@@ -565,6 +568,37 @@ describe("releaseIssueExecution", () => {
       reason: "Deferred execution wake no longer applies to a terminal task",
     }));
     expect(result.outcome.kind).toBe("released");
+  });
+
+  it("still promotes (without forcing a reopen) when nobody can prove the re-closing run read the comment (AUR-2767, Greptile P1)", async () => {
+    // Mirror of the test above with unproven self-authorship: the finishing
+    // run's re-closure might be fully unrelated to this comment, so silently
+    // cancelling the wake here would drop unread human/external input. The
+    // fix must still wake the assignee - it must just stop forcing a second
+    // `status: "todo"` write that would clobber whatever the finishing run
+    // legitimately decided.
+    const queue = [wakeCandidate({
+      agentId: ISSUE.assigneeAgentId!,
+      requestedByActorType: "user",
+      wakeReason: "issue_reopened_via_comment",
+      deferredCommentIds: ["unread-comment"],
+    })];
+    const transaction = createFakeTransaction({
+      findNextDeferredWake: vi.fn(async () => queue.shift() ?? null),
+      getCommentSelfAuthorship: vi.fn(async () => ({ allSelfAuthored: false })),
+      reopenIssue: vi.fn(async () => ({ ...ISSUE, status: "todo" })),
+    });
+    const release = createReleaseIssueExecution({
+      issueLock: createFakeIssueLock(createFakeHost(), transaction, { ...ISSUE, status: "done" }),
+      recovery: createFakeRecovery(),
+    });
+
+    const result = await release({ companyId: RUN.companyId, runId: RUN.id, now: new Date() });
+
+    expect(transaction.reopenIssue).not.toHaveBeenCalled();
+    expect(transaction.cancelDeferredWake).not.toHaveBeenCalled();
+    expect(transaction.finalizePromotedWake).toHaveBeenCalledTimes(1);
+    expect(result.outcome.kind).toBe("promoted");
   });
 
   it.each(["done_live", "cancelled_live", "done_missing", "done_self", "done_no_resume", "done_untracked_comment"])("handles explicit agent feedback after completion: %s", async (scenario) => {

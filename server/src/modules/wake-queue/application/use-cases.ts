@@ -328,6 +328,10 @@ async function promoteDeferredWake(
 ): Promise<ReleaseTransactionResult | null> {
   let currentIssue = issue;
   let shouldReopen = false;
+  // Forces promotion even though `shouldReopen` stays false and the issue is
+  // terminal, so the terminal-task cancellation below does not silently drop
+  // a comment nobody has proven was ever read.
+  let forcePromotionDespiteTerminal = false;
   if (
     !workingCandidate.authorizedFailedChatRetry &&
     workingCandidate.deferredCommentIds.length > 0 &&
@@ -339,24 +343,31 @@ async function promoteDeferredWake(
       finishingRunId: run.id,
       commentIds: workingCandidate.deferredCommentIds,
     });
-    // A wake tagged `issue_reopened_via_comment` was already classified as a
-    // reopen by the route handler that created it (`server/src/routes/issues.ts`),
-    // which unconditionally wrote the issue back to `todo` in the same request
-    // before this wake was ever enqueued. Re-deriving `shouldReopen` from that
-    // stale tag here would blindly redo that write, clobbering any legitimate
-    // status transition the assignee made since (e.g. the same run closing the
-    // issue again after reading the triggering comment on its own). Leave such
-    // wakes out of this re-derivation; the terminal-task cancellation below then
-    // retires them instead of forcing a second, redundant reopen.
-    shouldReopen =
-      workingCandidate.wakeReason !== "issue_reopened_via_comment" &&
-      !selfAuthorship.allSelfAuthored &&
-      (workingCandidate.requestedByActorType === "user" ||
-        (currentIssue.status === "done" &&
-          workingCandidate.agentId === currentIssue.assigneeAgentId &&
-          workingCandidate.requestedByActorType === "agent" &&
-          workingCandidate.deferredContextSeed.resumeIntent === true &&
-          workingCandidate.queuedCommentIds.length > 0));
+    if (workingCandidate.wakeReason === "issue_reopened_via_comment") {
+      // A wake tagged `issue_reopened_via_comment` was already classified as
+      // a reopen by the route handler that created it
+      // (`server/src/routes/issues.ts`), which unconditionally wrote the
+      // issue back to `todo` in the same request before this wake was ever
+      // enqueued. Re-deriving a second `status: "todo"` write from that
+      // stale tag here would blindly redo it, clobbering any legitimate
+      // status transition the assignee made since (e.g. the same run
+      // closing the issue again after reading the triggering comment on its
+      // own). Only skip promoting this wake outright when the finishing run
+      // can be proven to have authored the triggering comment itself - then
+      // its later closure is demonstrably an informed decision. Otherwise,
+      // still promote so unread human/external input is never silently
+      // dropped; just do not force the redundant reopen write.
+      forcePromotionDespiteTerminal = !selfAuthorship.allSelfAuthored;
+    } else {
+      shouldReopen =
+        !selfAuthorship.allSelfAuthored &&
+        (workingCandidate.requestedByActorType === "user" ||
+          (currentIssue.status === "done" &&
+            workingCandidate.agentId === currentIssue.assigneeAgentId &&
+            workingCandidate.requestedByActorType === "agent" &&
+            workingCandidate.deferredContextSeed.resumeIntent === true &&
+            workingCandidate.queuedCommentIds.length > 0));
+    }
   }
 
   // Agent continuations can outlive the work they addressed. Live,
@@ -366,6 +377,7 @@ async function promoteDeferredWake(
   // the compare-and-set still sees the deferred wake.
   if (
     !shouldReopen &&
+    !forcePromotionDespiteTerminal &&
     (currentIssue.status === "done" || currentIssue.status === "cancelled") &&
     workingCandidate.agentId === currentIssue.assigneeAgentId
   ) {

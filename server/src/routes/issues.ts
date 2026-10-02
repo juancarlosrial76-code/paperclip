@@ -295,7 +295,6 @@ import {
   applyIssueExecutionPolicyTransition,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
-  redactIssueMonitorExternalRef,
   setIssueExecutionPolicyMonitorScheduledBy,
 } from "../services/issue-execution-policy.js";
 import { parseIssueExecutionWorkspaceSettings } from "../services/execution-workspace-policy.js";
@@ -2237,9 +2236,7 @@ function summarizeIssueMonitor(
     kind: policy?.monitor?.kind ?? state?.monitor?.kind ?? null,
     serviceName:
       policy?.monitor?.serviceName ?? state?.monitor?.serviceName ?? null,
-    externalRef: redactIssueMonitorExternalRef(
-      policy?.monitor?.externalRef ?? state?.monitor?.externalRef ?? null,
-    ),
+    externalRef: policy?.monitor?.externalRef ?? state?.monitor?.externalRef ?? null,
     timeoutAt: policy?.monitor?.timeoutAt ?? state?.monitor?.timeoutAt ?? null,
     maxAttempts:
       policy?.monitor?.maxAttempts ?? state?.monitor?.maxAttempts ?? null,

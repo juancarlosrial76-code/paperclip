@@ -760,7 +760,7 @@ describe("issue execution policy routes", () => {
     expect(res.body.executionPolicy.monitor.externalRef).toBe(externalRef);
   });
 
-  it("omits monitor.externalRef from the issue.updated activity log while it still persists and round-trips through GET", async () => {
+  it("omits monitor.externalRef from the issue.updated activity log while the PATCH response still carries it", async () => {
     const issue = {
       id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
       companyId: "company-1",
